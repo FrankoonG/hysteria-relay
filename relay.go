@@ -1,14 +1,4 @@
-// Package relay provides reverse traffic forwarding through a Hysteria 2 tunnel.
-//
-// Architecture:
-//   - Exit node: runs hy2 CLIENT, connects to entry node, then calls
-//     relay.ServeExitNode which opens a control stream and waits for
-//     dial requests from the entry node.
-//   - Entry node: runs hy2 SERVER, uses a custom Outbound that detects
-//     relay streams. Provides DialTCP for user-facing services (SOCKS5 etc).
-//
-// All traffic flows inside the hy2 tunnel. hy2 handles NAT traversal,
-// encryption, authentication, and Brutal CC.
+// Package relay provides bidirectional traffic forwarding through a Hysteria 2 tunnel.
 package relay
 
 import (
@@ -17,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,204 +16,259 @@ import (
 )
 
 const (
-	// StreamControl is the hy2 target address for the relay control stream.
-	StreamControl = "_relay_ctrl_"
-	// StreamData prefix for data streams: "_relay_data_<id>".
+	streamCtrlC2S    = "_relay_c2s_ctrl_"
+	streamCtrlS2C    = "_relay_s2c_ctrl_"
 	streamDataPrefix = "_relay_data_"
 )
 
-// IsRelayStream checks if a target address is a relay internal stream.
 func IsRelayStream(addr string) bool {
-	return addr == StreamControl || len(addr) > len(streamDataPrefix) && addr[:len(streamDataPrefix)] == streamDataPrefix
+	return addr == streamCtrlC2S || addr == streamCtrlS2C ||
+		strings.HasPrefix(addr, streamDataPrefix)
 }
 
-// --- Entry Node (public IP side) ---
-
-// EntryNode sits on the public-IP side. It provides DialTCP which sends
-// traffic through the hy2 tunnel to the exit node.
-type EntryNode struct {
+type Node struct {
 	mu      sync.Mutex
-	control net.Conn        // control stream to exit node
-	pending map[string]chan net.Conn
+	writeMu sync.Mutex
+	ctrlW   net.Conn                 // write dial requests to peer
+	client  hyclient.Client          // non-nil if we're the hy2 client side
+	waiting map[string]chan net.Conn
 	ready   chan struct{}
 	seq     atomic.Uint64
 }
 
-func NewEntryNode() *EntryNode {
-	return &EntryNode{
-		pending: make(map[string]chan net.Conn),
+func NewNode() *Node {
+	return &Node{
+		waiting: make(map[string]chan net.Conn),
 		ready:   make(chan struct{}),
 	}
 }
 
-// HandleControlStream is called when the exit node opens the control stream.
-// Your hy2 server Outbound.TCP should call this when reqAddr == StreamControl.
-// Blocks until the stream is closed.
-func (e *EntryNode) HandleControlStream(ctx context.Context, stream net.Conn) {
-	e.mu.Lock()
-	e.control = stream
+// Attach is called on the hy2 CLIENT side.
+func (n *Node) Attach(ctx context.Context, client hyclient.Client) error {
+	c2sCtrl, err := client.TCP(streamCtrlC2S)
+	if err != nil {
+		return err
+	}
+	defer c2sCtrl.Close()
+
+	s2cCtrl, err := client.TCP(streamCtrlS2C)
+	if err != nil {
+		return err
+	}
+	defer s2cCtrl.Close()
+
+	n.mu.Lock()
+	n.ctrlW = c2sCtrl
+	n.client = client
 	select {
-	case <-e.ready:
+	case <-n.ready:
 	default:
-		close(e.ready)
+		close(n.ready)
 	}
-	e.mu.Unlock()
+	n.mu.Unlock()
 
-	// Block until done
+	// Handle dial requests from server (B→A direction)
+	go func() {
+		for {
+			id, addr, err := readRequest(s2cCtrl)
+			if err != nil {
+				return
+			}
+			go n.dialAndStream(ctx, client, id, addr)
+		}
+	}()
+
 	<-ctx.Done()
-	stream.Close()
+	return ctx.Err()
 }
 
-// HandleDataStream is called when the exit node opens a data stream.
-// Your hy2 server Outbound.TCP should call this when reqAddr starts with
-// streamDataPrefix. Returns the dial ID for logging.
-func (e *EntryNode) HandleDataStream(stream net.Conn, reqAddr string) {
-	dialID := reqAddr[len(streamDataPrefix):]
-	e.mu.Lock()
-	ch, ok := e.pending[dialID]
-	if ok {
-		delete(e.pending, dialID)
+// dialAndStream dials target locally and opens data stream via client.TCP.
+func (n *Node) dialAndStream(ctx context.Context, client hyclient.Client, id, addr string) {
+	target, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		return
 	}
-	e.mu.Unlock()
+	defer target.Close()
 
-	if ok {
-		ch <- stream
-	} else {
-		stream.Close()
+	stream, err := client.TCP(streamDataPrefix + id)
+	if err != nil {
+		return
+	}
+	defer stream.Close()
+
+	go func() { io.Copy(stream, target); stream.Close() }()
+	io.Copy(target, stream)
+}
+
+// HandleStream is called on the hy2 SERVER side from Outbound.TCP.
+func (n *Node) HandleStream(ctx context.Context, reqAddr string, stream net.Conn) {
+	switch reqAddr {
+	case streamCtrlC2S:
+		// Client's dial requests → server dials targets, waits for data streams
+		n.serveDials(ctx, stream)
+
+	case streamCtrlS2C:
+		// Server's outbound ctrl → server writes dial requests here
+		n.mu.Lock()
+		n.ctrlW = stream
+		select {
+		case <-n.ready:
+		default:
+			close(n.ready)
+		}
+		n.mu.Unlock()
+		<-ctx.Done()
+
+	default:
+		if strings.HasPrefix(reqAddr, streamDataPrefix) {
+			id := reqAddr[len(streamDataPrefix):]
+			// Try to deliver to a waiter, with retries for race conditions
+			for i := 0; i < 50; i++ {
+				n.mu.Lock()
+				ch, ok := n.waiting[id]
+				if ok {
+					delete(n.waiting, id)
+					n.mu.Unlock()
+					ch <- stream
+					return
+				}
+				n.mu.Unlock()
+				time.Sleep(10 * time.Millisecond)
+			}
+			stream.Close()
+		}
 	}
 }
 
-// DialTCP opens a TCP connection to addr through the exit node.
-func (e *EntryNode) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
-	// Wait for exit node
+// serveDials handles dial requests from client side.
+// Server dials target, registers in waiting, client opens data stream.
+func (n *Node) serveDials(ctx context.Context, ctrl net.Conn) {
+	for {
+		id, addr, err := readRequest(ctrl)
+		if err != nil {
+			return
+		}
+		go func() {
+			target, err := net.DialTimeout("tcp", addr, 10*time.Second)
+			if err != nil {
+				return
+			}
+
+			ch := make(chan net.Conn, 1)
+			n.mu.Lock()
+			n.waiting[id] = ch
+			n.mu.Unlock()
+
+			select {
+			case stream := <-ch:
+				defer stream.Close()
+				defer target.Close()
+				go func() { io.Copy(stream, target); stream.Close() }()
+				io.Copy(target, stream)
+			case <-time.After(15 * time.Second):
+				n.mu.Lock()
+				delete(n.waiting, id)
+				n.mu.Unlock()
+				target.Close()
+			case <-ctx.Done():
+				target.Close()
+			}
+		}()
+	}
+}
+
+// DialTCP dials addr through the peer's network.
+func (n *Node) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
 	select {
-	case <-e.ready:
+	case <-n.ready:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 
-	// Generate unique dial ID
-	id := fmt.Sprintf("%d", e.seq.Add(1))
+	id := fmt.Sprintf("%d", n.seq.Add(1))
 
-	// Register pending
-	ch := make(chan net.Conn, 1)
-	e.mu.Lock()
-	e.pending[id] = ch
-	ctrl := e.control
-	e.mu.Unlock()
+	n.mu.Lock()
+	ctrl := n.ctrlW
+	client := n.client // non-nil if we're hy2 client side
+	n.mu.Unlock()
 
 	if ctrl == nil {
-		return nil, fmt.Errorf("relay: no exit node")
+		return nil, fmt.Errorf("relay: no peer")
 	}
 
-	// Send dial request: [2-byte id_len][id][2-byte addr_len][addr]
-	e.mu.Lock()
+	// Send dial request to peer
+	n.writeMu.Lock()
 	err := writeRequest(ctrl, id, addr)
-	e.mu.Unlock()
+	n.writeMu.Unlock()
 	if err != nil {
-		return nil, fmt.Errorf("relay: write request: %w", err)
+		return nil, err
 	}
 
-	// Wait for exit node to open data stream
+	if client != nil {
+		// We're hy2 client side. Peer (server) dials target and waits in
+		// waiting map. We open data stream to deliver it.
+		stream, err := client.TCP(streamDataPrefix + id)
+		if err != nil {
+			return nil, err
+		}
+		return stream, nil
+	}
+
+	// We're hy2 server side. Peer (client) will dial target and open
+	// data stream to us. Wait for it.
+	ch := make(chan net.Conn, 1)
+	n.mu.Lock()
+	n.waiting[id] = ch
+	n.mu.Unlock()
+
 	select {
 	case conn := <-ch:
+		if conn == nil {
+			return nil, fmt.Errorf("relay: dial failed")
+		}
 		return conn, nil
 	case <-ctx.Done():
-		e.mu.Lock()
-		delete(e.pending, id)
-		e.mu.Unlock()
+		n.mu.Lock()
+		delete(n.waiting, id)
+		n.mu.Unlock()
 		return nil, ctx.Err()
 	}
 }
 
-func (e *EntryNode) HasExitNode() bool {
+func (n *Node) HasPeer() bool {
 	select {
-	case <-e.ready:
+	case <-n.ready:
 		return true
 	default:
 		return false
 	}
 }
 
-// --- Exit Node (NAT'd side) ---
-
-// ServeExitNode connects to the entry node's hy2 server, opens a control
-// stream, and handles dial requests. Blocks until ctx is cancelled.
-func ServeExitNode(ctx context.Context, client hyclient.Client) error {
-	// Open control stream
-	ctrl, err := client.TCP(StreamControl)
-	if err != nil {
-		return fmt.Errorf("relay: control stream: %w", err)
-	}
-	defer ctrl.Close()
-
-	// Read dial requests and handle them
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		id, addr, err := readRequest(ctrl)
-		if err != nil {
-			return fmt.Errorf("relay: read request: %w", err)
-		}
-
-		go handleDial(ctx, client, id, addr)
-	}
-}
-
-func handleDial(ctx context.Context, client hyclient.Client, dialID, addr string) {
-	// Dial target locally
-	target, err := net.DialTimeout("tcp", addr, 10*time.Second)
-	if err != nil {
-		return // silently fail — entry side will timeout
-	}
-	defer target.Close()
-
-	// Open data stream back to entry node
-	stream, err := client.TCP(streamDataPrefix + dialID)
-	if err != nil {
-		return
-	}
-	defer stream.Close()
-
-	// Relay
-	go func() { io.Copy(stream, target); stream.Close() }()
-	io.Copy(target, stream)
-}
-
-// --- Wire protocol (inside hy2 TCP streams) ---
-
 func writeRequest(w io.Writer, id, addr string) error {
-	idBytes := []byte(id)
-	addrBytes := []byte(addr)
-	buf := make([]byte, 2+len(idBytes)+2+len(addrBytes))
-	binary.BigEndian.PutUint16(buf[0:2], uint16(len(idBytes)))
-	copy(buf[2:], idBytes)
-	off := 2 + len(idBytes)
-	binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(addrBytes)))
-	copy(buf[off+2:], addrBytes)
+	idB, addrB := []byte(id), []byte(addr)
+	buf := make([]byte, 2+len(idB)+2+len(addrB))
+	binary.BigEndian.PutUint16(buf[0:2], uint16(len(idB)))
+	copy(buf[2:], idB)
+	off := 2 + len(idB)
+	binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(addrB)))
+	copy(buf[off+2:], addrB)
 	_, err := w.Write(buf)
 	return err
 }
 
 func readRequest(r io.Reader) (id, addr string, err error) {
-	var lenBuf [2]byte
-	if _, err = io.ReadFull(r, lenBuf[:]); err != nil {
+	var lb [2]byte
+	if _, err = io.ReadFull(r, lb[:]); err != nil {
 		return
 	}
-	idLen := binary.BigEndian.Uint16(lenBuf[:])
-	idBuf := make([]byte, idLen)
+	idBuf := make([]byte, binary.BigEndian.Uint16(lb[:]))
 	if _, err = io.ReadFull(r, idBuf); err != nil {
 		return
 	}
-	if _, err = io.ReadFull(r, lenBuf[:]); err != nil {
+	if _, err = io.ReadFull(r, lb[:]); err != nil {
 		return
 	}
-	addrLen := binary.BigEndian.Uint16(lenBuf[:])
-	addrBuf := make([]byte, addrLen)
+	addrBuf := make([]byte, binary.BigEndian.Uint16(lb[:]))
 	if _, err = io.ReadFull(r, addrBuf); err != nil {
 		return
 	}
