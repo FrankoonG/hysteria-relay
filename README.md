@@ -12,15 +12,15 @@ Node A (e.g. behind NAT)            Node B (e.g. public IP)
 │  hy2 CLIENT          │──tunnel──► │  hy2 SERVER          │
 │  relay.Node          │            │  relay.Node           │
 │                      │            │                       │
-│  A.DialTCP(addr) ────┼──request──►│  dials addr, relays   │
-│  dials addr, relays ◄┼──request───┤  B.DialTCP(addr)      │
+│  A.DialTCP(addr) ────┼──hy2 TCP──►│  Outbound dials addr  │
+│  Outbound dials addr◄┼──control───┤  B.DialTCP(addr)      │
 └──────────────────────┘            └───────────────────────┘
 ```
 
-- Node A runs hy2 client, calls `node.Attach(ctx, hyClient)`
-- Node B runs hy2 server, routes relay streams via `node.HandleStream()` in its `Outbound.TCP`
-- Either node calls `node.DialTCP(ctx, addr)` to open a TCP connection that exits through the peer's network
-- All traffic flows inside the hy2 tunnel — hy2 handles NAT traversal, encryption, authentication, and Brutal CC
+- **A → B direction** (client side calls `DialTCP`): direct passthrough to `client.TCP(addr)` — standard hy2 behavior, zero relay overhead. The hy2 server's `Outbound.TCP` dials the target.
+- **B → A direction** (server side calls `DialTCP`): uses a relay control stream inside the hy2 tunnel, because hy2 server cannot initiate streams to the client. The client dials the target and opens a data stream back.
+
+All traffic flows inside the hy2 tunnel — hy2 handles NAT traversal, encryption, authentication, and Brutal CC.
 
 ## Usage
 
@@ -38,7 +38,7 @@ hyClient, _, _ := hyclient.NewClient(&hyclient.Config{
 // Attach opens control streams inside the hy2 tunnel. Blocks.
 go node.Attach(ctx, hyClient)
 
-// Traffic exits through Node B's network:
+// Traffic exits through Node B's network (direct client.TCP passthrough):
 conn, _ := node.DialTCP(ctx, "example.com:443")
 ```
 
@@ -55,7 +55,7 @@ hyServer, _ := hyserver.NewServer(&hyserver.Config{
 })
 go hyServer.Serve()
 
-// Traffic exits through Node A's network:
+// Traffic exits through Node A's network (via relay control stream):
 conn, _ := node.DialTCP(ctx, "10.0.0.1:22")
 ```
 
@@ -79,25 +79,11 @@ func (o *myOutbound) TCP(reqAddr string) (net.Conn, error) {
 ## API
 
 ```go
-// NewNode creates a symmetric relay endpoint.
 func NewNode() *Node
-
-// Attach connects to a peer via an hy2 client. Call on the hy2 client side.
-// Opens control streams inside the tunnel. Blocks until ctx is cancelled.
 func (n *Node) Attach(ctx context.Context, client hyclient.Client) error
-
-// HandleStream routes incoming relay streams. Call from hy2 server Outbound.TCP
-// when IsRelayStream(reqAddr) returns true.
 func (n *Node) HandleStream(ctx context.Context, reqAddr string, stream net.Conn)
-
-// DialTCP opens a TCP connection to addr through the peer's network.
-// Can be called from either side.
 func (n *Node) DialTCP(ctx context.Context, addr string) (net.Conn, error)
-
-// HasPeer returns true if a peer is connected.
 func (n *Node) HasPeer() bool
-
-// IsRelayStream returns true if the address is a relay internal stream.
 func IsRelayStream(addr string) bool
 ```
 
@@ -105,5 +91,5 @@ func IsRelayStream(addr string) bool
 
 - **Symmetric**: single `Node` type, no entry/exit distinction
 - **Inside hy2**: all relay traffic flows through hy2 TCP streams
+- **Zero overhead on client side**: `DialTCP` is a direct `client.TCP` passthrough
 - **No custom transport**: no extra ports, no separate auth, no framing
-- **hy2 handles everything**: NAT traversal, encryption, authentication, Brutal CC
