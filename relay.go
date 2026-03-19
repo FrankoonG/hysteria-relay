@@ -270,7 +270,16 @@ func (n *Node) deliverDataStream(id string, stream net.Conn) {
 }
 
 func (n *Node) dialAndStream(ctx context.Context, client hyclient.Client, id, addr string) {
-	target, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	var target net.Conn
+	var err error
+
+	// Check if addr is a via request (multi-hop forwarding)
+	if peerName, targetAddr, ok := parseVia(addr); ok {
+		// Route through one of our peers
+		target, err = n.DialTCP(ctx, peerName, targetAddr)
+	} else {
+		target, err = net.DialTimeout("tcp", addr, 10*time.Second)
+	}
 	if err != nil {
 		return
 	}
@@ -425,7 +434,34 @@ func (n *Node) DialVia(ctx context.Context, path []string, addr string) (net.Con
 		return p.client.TCP(viaAddr)
 	}
 
-	return nil, fmt.Errorf("relay: cannot route via inbound peer %q for multi-hop", firstPeer)
+	// Inbound peer: send via address as a dial request through control stream.
+	// The inbound peer receives viaAddr, its handleVia will parse and forward.
+	if p.ctrlW == nil {
+		return nil, fmt.Errorf("relay: peer %q control not ready", firstPeer)
+	}
+
+	id := fmt.Sprintf("%d", n.seq.Add(1))
+	ch := make(chan net.Conn, 1)
+	p.writeMu.Lock()
+	p.waiting[id] = ch
+	err := writeRequest(p.ctrlW, id, viaAddr)
+	p.writeMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	select {
+	case conn := <-ch:
+		if conn == nil {
+			return nil, fmt.Errorf("relay: dial via %q failed", firstPeer)
+		}
+		return conn, nil
+	case <-ctx.Done():
+		p.writeMu.Lock()
+		delete(p.waiting, id)
+		p.writeMu.Unlock()
+		return nil, ctx.Err()
+	}
 }
 
 // --- Wire helpers ---
