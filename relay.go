@@ -25,7 +25,8 @@ import (
 
 const (
 	streamRegister   = "_relay_register_:0"
-	streamCtrlS2C    = "_relay_s2c_ctrl_:0" // bridge → node dial requests
+	streamCtrlS2C    = "_relay_s2c_ctrl_:0"
+	streamViaPrefix  = "_relay_via_"       // routing: _relay_via_<node>_<addr>:0
 	streamDataPrefix = "_relay_data_"
 	streamDataSuffix = ":0"
 )
@@ -34,7 +35,26 @@ const (
 func IsRelayStream(addr string) bool {
 	return addr == streamRegister ||
 		addr == streamCtrlS2C ||
+		strings.HasPrefix(addr, streamViaPrefix) ||
 		strings.HasPrefix(addr, streamDataPrefix)
+}
+
+// parseVia extracts node name and target addr from a _relay_via_ stream.
+// Format: _relay_via_<nodeName>_<addr>:0
+func parseVia(reqAddr string) (nodeName, targetAddr string, ok bool) {
+	if !strings.HasPrefix(reqAddr, streamViaPrefix) {
+		return "", "", false
+	}
+	rest := reqAddr[len(streamViaPrefix):]
+	// Find the separator between node name and target addr
+	// Node name cannot contain '_', target addr is everything after first '_'
+	idx := strings.Index(rest, "_")
+	if idx <= 0 {
+		return "", "", false
+	}
+	nodeName = rest[:idx]
+	targetAddr = strings.TrimSuffix(rest[idx+1:], ":0")
+	return nodeName, targetAddr, true
 }
 
 // --- NodeInfo ---
@@ -88,6 +108,12 @@ func (b *Bridge) HandleStream(ctx context.Context, reqAddr string, stream net.Co
 		<-ctx.Done()
 
 	default:
+		// Route-via: node requests traffic through a specific exit node
+		if nodeName, targetAddr, ok := parseVia(reqAddr); ok {
+			b.handleVia(ctx, nodeName, targetAddr, stream)
+			return
+		}
+
 		if strings.HasPrefix(reqAddr, streamDataPrefix) {
 			id := strings.TrimSuffix(reqAddr[len(streamDataPrefix):], streamDataSuffix)
 			// Find which node this data stream belongs to
@@ -162,6 +188,22 @@ func (b *Bridge) handleRegister(ctx context.Context, stream net.Conn) {
 	b.mu.Lock()
 	delete(b.nodes, name)
 	b.mu.Unlock()
+}
+
+// handleVia: a node requested traffic through another node.
+// Bridge dials the target via the specified exit node, then relays between
+// the requesting stream and the exit stream.
+func (b *Bridge) handleVia(ctx context.Context, nodeName, targetAddr string, stream net.Conn) {
+	exitConn, err := b.DialTCP(ctx, nodeName, targetAddr)
+	if err != nil {
+		stream.Close()
+		return
+	}
+	defer exitConn.Close()
+	defer stream.Close()
+
+	go func() { io.Copy(exitConn, stream); exitConn.Close() }()
+	io.Copy(stream, exitConn)
 }
 
 // Nodes returns all connected nodes.
@@ -346,6 +388,25 @@ func (n *Node) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
 		return nil, fmt.Errorf("relay: not connected")
 	}
 	return client.TCP(addr)
+}
+
+// DialVia dials addr through a specific exit node's network.
+// Traffic flows: this node → bridge → target node → internet.
+func (n *Node) DialVia(ctx context.Context, nodeName, addr string) (net.Conn, error) {
+	select {
+	case <-n.ready:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	n.mu.Lock()
+	client := n.client
+	n.mu.Unlock()
+	if client == nil {
+		return nil, fmt.Errorf("relay: not connected")
+	}
+	// Encode as _relay_via_<nodeName>_<addr>:0
+	viaAddr := streamViaPrefix + nodeName + "_" + addr + ":0"
+	return client.TCP(viaAddr)
 }
 
 // HasPeer returns true if connected to the bridge.
