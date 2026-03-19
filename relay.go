@@ -294,19 +294,25 @@ func (n *Node) Attach(ctx context.Context, client hyclient.Client) error {
 	}
 	n.mu.Unlock()
 
-	// Serve dial requests from bridge
+	// Serve dial requests from bridge — blocks until stream breaks
+	errCh := make(chan error, 1)
 	go func() {
 		for {
 			id, addr, err := readRequest(s2cCtrl)
 			if err != nil {
+				errCh <- err
 				return
 			}
 			go n.dialAndStream(ctx, client, id, addr)
 		}
 	}()
 
-	<-ctx.Done()
-	return ctx.Err()
+	select {
+	case err := <-errCh:
+		return fmt.Errorf("relay: control stream closed: %w", err)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (n *Node) dialAndStream(ctx context.Context, client hyclient.Client, id, addr string) {
