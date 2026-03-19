@@ -1,17 +1,18 @@
-// Package relay provides multi-node traffic forwarding through Hysteria 2 tunnels.
+// Package relay provides decentralized peer-to-peer traffic forwarding
+// through Hysteria 2 tunnels.
 //
-// Architecture (Tailscale-like):
+// Every node is equal — each can run both an hy2 server (accepting peers)
+// and multiple hy2 clients (connecting to peers). Peers can route traffic
+// through each other's network.
 //
-//	Bridge (hy2 server, public IP) — coordination + relay hub
-//	Nodes  (hy2 clients, behind NAT) — connect to bridge, may advertise exit capability
-//
-//	Any node can route traffic through any other node's network.
-//	The bridge facilitates routing and can also serve as an exit itself.
+// Peer discovery is local by default (only directly connected peers).
+// Nested discovery (seeing a peer's peers) is opt-in per peer.
 package relay
 
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -26,7 +27,8 @@ import (
 const (
 	streamRegister   = "_relay_register_:0"
 	streamCtrlS2C    = "_relay_s2c_ctrl_:0"
-	streamViaPrefix  = "_relay_via_"       // routing: _relay_via_<node>_<addr>:0
+	streamListPeers  = "_relay_list_peers_:0"
+	streamViaPrefix  = "_relay_via_"
 	streamDataPrefix = "_relay_data_"
 	streamDataSuffix = ":0"
 )
@@ -35,276 +37,57 @@ const (
 func IsRelayStream(addr string) bool {
 	return addr == streamRegister ||
 		addr == streamCtrlS2C ||
+		addr == streamListPeers ||
 		strings.HasPrefix(addr, streamViaPrefix) ||
 		strings.HasPrefix(addr, streamDataPrefix)
 }
 
-// parseVia extracts node name and target addr from a _relay_via_ stream.
-// Format: _relay_via_<nodeName>_<addr>:0
-func parseVia(reqAddr string) (nodeName, targetAddr string, ok bool) {
-	if !strings.HasPrefix(reqAddr, streamViaPrefix) {
-		return "", "", false
-	}
-	rest := reqAddr[len(streamViaPrefix):]
-	// Find the separator between node name and target addr
-	// Node name cannot contain '_', target addr is everything after first '_'
-	idx := strings.Index(rest, "_")
-	if idx <= 0 {
-		return "", "", false
-	}
-	nodeName = rest[:idx]
-	targetAddr = strings.TrimSuffix(rest[idx+1:], ":0")
-	return nodeName, targetAddr, true
+// PeerInfo describes a connected peer.
+type PeerInfo struct {
+	Name      string `json:"name"`
+	ExitNode  bool   `json:"exit_node"`
+	Direction string `json:"direction"` // "inbound" or "outbound"
 }
 
-// --- NodeInfo ---
+// --- Node ---
 
-// NodeInfo describes a connected node.
-type NodeInfo struct {
-	Name     string
-	ExitNode bool
-}
-
-// --- Bridge (hy2 server side) ---
-
-// Bridge is the central hub. It tracks connected nodes and routes traffic.
-type Bridge struct {
-	mu    sync.RWMutex
-	nodes map[string]*bridgeNode // name → node
-	seq   atomic.Uint64
-}
-
-type bridgeNode struct {
-	info    NodeInfo
-	ctrlW   net.Conn // write dial requests to this node
+type peer struct {
+	info    PeerInfo
+	client  hyclient.Client // non-nil for outbound (we connected to them)
+	ctrlW   net.Conn        // write dial requests to this peer
 	writeMu sync.Mutex
 	waiting map[string]chan net.Conn
 }
 
-// NewBridge creates a bridge.
-func NewBridge() *Bridge {
-	return &Bridge{nodes: make(map[string]*bridgeNode)}
-}
-
-// HandleStream routes relay streams from Outbound.TCP.
-func (b *Bridge) HandleStream(ctx context.Context, reqAddr string, stream net.Conn) {
-	switch reqAddr {
-	case streamRegister:
-		b.handleRegister(ctx, stream)
-
-	case streamCtrlS2C:
-		// Node opened s2c ctrl — bridge writes dial requests here
-		// Read the node name header first
-		name, err := readString(stream)
-		if err != nil {
-			stream.Close()
-			return
-		}
-		b.mu.Lock()
-		if n, ok := b.nodes[name]; ok {
-			n.ctrlW = stream
-		}
-		b.mu.Unlock()
-		<-ctx.Done()
-
-	default:
-		// Route-via: node requests traffic through a specific exit node
-		if nodeName, targetAddr, ok := parseVia(reqAddr); ok {
-			b.handleVia(ctx, nodeName, targetAddr, stream)
-			return
-		}
-
-		if strings.HasPrefix(reqAddr, streamDataPrefix) {
-			id := strings.TrimSuffix(reqAddr[len(streamDataPrefix):], streamDataSuffix)
-			// Find which node this data stream belongs to
-			b.mu.RLock()
-			for _, n := range b.nodes {
-				n.writeMu.Lock()
-				ch, ok := n.waiting[id]
-				if ok {
-					delete(n.waiting, id)
-					n.writeMu.Unlock()
-					b.mu.RUnlock()
-					ch <- stream
-					return
-				}
-				n.writeMu.Unlock()
-			}
-			b.mu.RUnlock()
-
-			// Retry with delay (race condition)
-			for i := 0; i < 50; i++ {
-				time.Sleep(10 * time.Millisecond)
-				b.mu.RLock()
-				for _, n := range b.nodes {
-					n.writeMu.Lock()
-					ch, ok := n.waiting[id]
-					if ok {
-						delete(n.waiting, id)
-						n.writeMu.Unlock()
-						b.mu.RUnlock()
-						ch <- stream
-						return
-					}
-					n.writeMu.Unlock()
-				}
-				b.mu.RUnlock()
-			}
-			stream.Close()
-		}
-	}
-}
-
-func (b *Bridge) handleRegister(ctx context.Context, stream net.Conn) {
-	// Read registration: [1-byte flags] [name]
-	var flags [1]byte
-	if _, err := io.ReadFull(stream, flags[:]); err != nil {
-		stream.Close()
-		return
-	}
-	name, err := readString(stream)
-	if err != nil {
-		stream.Close()
-		return
-	}
-
-	info := NodeInfo{
-		Name:     name,
-		ExitNode: flags[0]&0x01 != 0,
-	}
-
-	bn := &bridgeNode{
-		info:    info,
-		waiting: make(map[string]chan net.Conn),
-	}
-
-	b.mu.Lock()
-	b.nodes[name] = bn
-	b.mu.Unlock()
-
-	// Block until disconnect
-	<-ctx.Done()
-
-	b.mu.Lock()
-	delete(b.nodes, name)
-	b.mu.Unlock()
-}
-
-// handleVia: a node requested traffic through another node.
-// Bridge dials the target via the specified exit node, then relays between
-// the requesting stream and the exit stream.
-func (b *Bridge) handleVia(ctx context.Context, nodeName, targetAddr string, stream net.Conn) {
-	exitConn, err := b.DialTCP(ctx, nodeName, targetAddr)
-	if err != nil {
-		stream.Close()
-		return
-	}
-	defer exitConn.Close()
-	defer stream.Close()
-
-	go func() { io.Copy(exitConn, stream); exitConn.Close() }()
-	io.Copy(stream, exitConn)
-}
-
-// Nodes returns all connected nodes.
-func (b *Bridge) Nodes() []NodeInfo {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	result := make([]NodeInfo, 0, len(b.nodes))
-	for _, n := range b.nodes {
-		result = append(result, n.info)
-	}
-	return result
-}
-
-// ExitNodes returns nodes advertising exit capability.
-func (b *Bridge) ExitNodes() []NodeInfo {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	var result []NodeInfo
-	for _, n := range b.nodes {
-		if n.info.ExitNode {
-			result = append(result, n.info)
-		}
-	}
-	return result
-}
-
-// DialTCP dials addr through a specific node's network.
-func (b *Bridge) DialTCP(ctx context.Context, nodeName string, addr string) (net.Conn, error) {
-	b.mu.RLock()
-	bn, ok := b.nodes[nodeName]
-	b.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("relay: node %q not found", nodeName)
-	}
-
-	if bn.ctrlW == nil {
-		return nil, fmt.Errorf("relay: node %q control stream not ready", nodeName)
-	}
-
-	id := fmt.Sprintf("%d", b.seq.Add(1))
-
-	// Send dial request to node
-	bn.writeMu.Lock()
-	ch := make(chan net.Conn, 1)
-	bn.waiting[id] = ch
-	err := writeRequest(bn.ctrlW, id, addr)
-	bn.writeMu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-
-	// Node dials target, opens data stream back
-	select {
-	case conn := <-ch:
-		if conn == nil {
-			return nil, fmt.Errorf("relay: dial via %q failed", nodeName)
-		}
-		return conn, nil
-	case <-ctx.Done():
-		bn.writeMu.Lock()
-		delete(bn.waiting, id)
-		bn.writeMu.Unlock()
-		return nil, ctx.Err()
-	}
-}
-
-// HasNode checks if a node is connected.
-func (b *Bridge) HasNode(name string) bool {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	_, ok := b.nodes[name]
-	return ok
-}
-
-// --- Node (hy2 client side) ---
-
-// NodeConfig configures a node.
-type NodeConfig struct {
-	Name     string // unique name for this node
-	ExitNode bool   // advertise as exit node
-}
-
-// Node connects to a bridge and can route traffic through other nodes.
+// Node is a unified relay endpoint. It can accept peers (hy2 server side)
+// and connect to peers (hy2 client side) simultaneously.
 type Node struct {
-	cfg    NodeConfig
-	mu     sync.Mutex
-	client hyclient.Client
-	ready  chan struct{}
+	name  string
+	exit  bool
+	mu    sync.RWMutex
+	peers map[string]*peer
+	seq   atomic.Uint64
+
+	nestedMu sync.RWMutex
+	nested   map[string]bool // peer name → nested discovery enabled
 }
 
-// NewNode creates a node with the given config.
-func NewNode(cfg NodeConfig) *Node {
+// NewNode creates a node.
+func NewNode(name string, exitNode bool) *Node {
 	return &Node{
-		cfg:   cfg,
-		ready: make(chan struct{}),
+		name:   name,
+		exit:   exitNode,
+		peers:  make(map[string]*peer),
+		nested: make(map[string]bool),
 	}
 }
 
-// Attach connects to the bridge, registers, and handles relay requests. Blocks.
-func (n *Node) Attach(ctx context.Context, client hyclient.Client) error {
-	// Register with bridge
+// --- Outbound: connect to a remote node's hy2 server ---
+
+// AttachTo connects to a remote node via an hy2 client, registers, and
+// handles dial requests from the remote. Blocks until ctx or connection ends.
+func (n *Node) AttachTo(ctx context.Context, peerName string, client hyclient.Client) error {
+	// Register with remote
 	regStream, err := client.TCP(streamRegister)
 	if err != nil {
 		return fmt.Errorf("relay: register: %w", err)
@@ -312,31 +95,36 @@ func (n *Node) Attach(ctx context.Context, client hyclient.Client) error {
 	defer regStream.Close()
 
 	var flags byte
-	if n.cfg.ExitNode {
+	if n.exit {
 		flags |= 0x01
 	}
 	regStream.Write([]byte{flags})
-	writeString(regStream, n.cfg.Name)
+	writeString(regStream, n.name)
 
-	// Open s2c ctrl — bridge writes dial requests here, we read and dial
+	// Open s2c ctrl for dial requests from remote
 	s2cCtrl, err := client.TCP(streamCtrlS2C)
 	if err != nil {
 		return fmt.Errorf("relay: s2c ctrl: %w", err)
 	}
 	defer s2cCtrl.Close()
-	// Send our name so bridge knows which node this ctrl belongs to
-	writeString(s2cCtrl, n.cfg.Name)
+	writeString(s2cCtrl, n.name)
 
-	n.mu.Lock()
-	n.client = client
-	select {
-	case <-n.ready:
-	default:
-		close(n.ready)
+	// Register peer (outbound)
+	p := &peer{
+		info:    PeerInfo{Name: peerName, Direction: "outbound"},
+		client:  client,
+		waiting: make(map[string]chan net.Conn),
 	}
+	n.mu.Lock()
+	n.peers[peerName] = p
 	n.mu.Unlock()
+	defer func() {
+		n.mu.Lock()
+		delete(n.peers, peerName)
+		n.mu.Unlock()
+	}()
 
-	// Serve dial requests from bridge — blocks until stream breaks
+	// Serve dial requests from remote
 	errCh := make(chan error, 1)
 	go func() {
 		for {
@@ -351,10 +139,134 @@ func (n *Node) Attach(ctx context.Context, client hyclient.Client) error {
 
 	select {
 	case err := <-errCh:
-		return fmt.Errorf("relay: control stream closed: %w", err)
+		return fmt.Errorf("relay: peer %s disconnected: %w", peerName, err)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// --- Inbound: accept peers connecting to our hy2 server ---
+
+// HandleStream routes relay streams from the hy2 server's Outbound.TCP.
+func (n *Node) HandleStream(ctx context.Context, reqAddr string, stream net.Conn) {
+	switch reqAddr {
+	case streamRegister:
+		n.handleRegister(ctx, stream)
+
+	case streamCtrlS2C:
+		name, err := readString(stream)
+		if err != nil {
+			stream.Close()
+			return
+		}
+		n.mu.Lock()
+		if p, ok := n.peers[name]; ok {
+			p.ctrlW = stream
+		}
+		n.mu.Unlock()
+		<-ctx.Done()
+
+	case streamListPeers:
+		n.handleListPeers(stream)
+
+	default:
+		if nodeName, targetAddr, ok := parseVia(reqAddr); ok {
+			n.handleVia(ctx, nodeName, targetAddr, stream)
+			return
+		}
+		if strings.HasPrefix(reqAddr, streamDataPrefix) {
+			id := strings.TrimSuffix(reqAddr[len(streamDataPrefix):], streamDataSuffix)
+			n.deliverDataStream(id, stream)
+		}
+	}
+}
+
+func (n *Node) handleRegister(ctx context.Context, stream net.Conn) {
+	var flags [1]byte
+	if _, err := io.ReadFull(stream, flags[:]); err != nil {
+		stream.Close()
+		return
+	}
+	name, err := readString(stream)
+	if err != nil {
+		stream.Close()
+		return
+	}
+
+	p := &peer{
+		info: PeerInfo{
+			Name:      name,
+			ExitNode:  flags[0]&0x01 != 0,
+			Direction: "inbound",
+		},
+		waiting: make(map[string]chan net.Conn),
+	}
+
+	n.mu.Lock()
+	n.peers[name] = p
+	n.mu.Unlock()
+
+	<-ctx.Done()
+
+	n.mu.Lock()
+	delete(n.peers, name)
+	n.mu.Unlock()
+}
+
+func (n *Node) handleListPeers(stream net.Conn) {
+	defer stream.Close()
+	peers := n.Peers()
+	data, _ := json.Marshal(peers)
+	stream.Write(data)
+}
+
+func (n *Node) handleVia(ctx context.Context, peerName, targetAddr string, stream net.Conn) {
+	exitConn, err := n.DialTCP(ctx, peerName, targetAddr)
+	if err != nil {
+		stream.Close()
+		return
+	}
+	defer exitConn.Close()
+	defer stream.Close()
+	go func() { io.Copy(exitConn, stream); exitConn.Close() }()
+	io.Copy(stream, exitConn)
+}
+
+func (n *Node) deliverDataStream(id string, stream net.Conn) {
+	n.mu.RLock()
+	for _, p := range n.peers {
+		p.writeMu.Lock()
+		ch, ok := p.waiting[id]
+		if ok {
+			delete(p.waiting, id)
+			p.writeMu.Unlock()
+			n.mu.RUnlock()
+			ch <- stream
+			return
+		}
+		p.writeMu.Unlock()
+	}
+	n.mu.RUnlock()
+
+	// Retry with delay
+	for i := 0; i < 50; i++ {
+		time.Sleep(10 * time.Millisecond)
+		n.mu.RLock()
+		for _, p := range n.peers {
+			p.writeMu.Lock()
+			ch, ok := p.waiting[id]
+			if ok {
+				delete(p.waiting, id)
+				p.writeMu.Unlock()
+				n.mu.RUnlock()
+				ch <- stream
+				return
+			}
+			p.writeMu.Unlock()
+		}
+		n.mu.RUnlock()
+	}
+	stream.Close()
 }
 
 func (n *Node) dialAndStream(ctx context.Context, client hyclient.Client, id, addr string) {
@@ -374,52 +286,163 @@ func (n *Node) dialAndStream(ctx context.Context, client hyclient.Client, id, ad
 	io.Copy(target, stream)
 }
 
-// DialTCP dials addr through the bridge's network (standard hy2 passthrough).
-func (n *Node) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
+// --- Peer queries ---
+
+// Peers returns directly connected peers.
+func (n *Node) Peers() []PeerInfo {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	result := make([]PeerInfo, 0, len(n.peers))
+	for _, p := range n.peers {
+		result = append(result, p.info)
+	}
+	return result
+}
+
+// PeersOf returns a peer's peers. Requires nested discovery enabled for that peer.
+func (n *Node) PeersOf(peerName string) ([]PeerInfo, error) {
+	n.nestedMu.RLock()
+	enabled := n.nested[peerName]
+	n.nestedMu.RUnlock()
+	if !enabled {
+		return nil, fmt.Errorf("relay: nested discovery not enabled for %q", peerName)
+	}
+
+	n.mu.RLock()
+	p, ok := n.peers[peerName]
+	n.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("relay: peer %q not connected", peerName)
+	}
+
+	if p.client == nil {
+		return nil, fmt.Errorf("relay: peer %q is inbound, cannot query (no client)", peerName)
+	}
+
+	// Open a list-peers stream to the peer
+	stream, err := p.client.TCP(streamListPeers)
+	if err != nil {
+		return nil, err
+	}
+	defer stream.Close()
+
+	data, err := io.ReadAll(stream)
+	if err != nil {
+		return nil, err
+	}
+
+	var peers []PeerInfo
+	if err := json.Unmarshal(data, &peers); err != nil {
+		return nil, err
+	}
+	return peers, nil
+}
+
+// SetNestedDiscovery enables/disables nested peer discovery for a peer.
+func (n *Node) SetNestedDiscovery(peerName string, enabled bool) {
+	n.nestedMu.Lock()
+	n.nested[peerName] = enabled
+	n.nestedMu.Unlock()
+}
+
+// HasPeer checks if a peer is connected.
+func (n *Node) HasPeer(name string) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	_, ok := n.peers[name]
+	return ok
+}
+
+// --- Dial ---
+
+// DialTCP dials addr through a directly connected peer's network.
+func (n *Node) DialTCP(ctx context.Context, peerName string, addr string) (net.Conn, error) {
+	n.mu.RLock()
+	p, ok := n.peers[peerName]
+	n.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("relay: peer %q not connected", peerName)
+	}
+
+	// Outbound peer: we have a client, use it directly
+	if p.client != nil {
+		return p.client.TCP(addr)
+	}
+
+	// Inbound peer: send dial request via control stream
+	if p.ctrlW == nil {
+		return nil, fmt.Errorf("relay: peer %q control not ready", peerName)
+	}
+
+	id := fmt.Sprintf("%d", n.seq.Add(1))
+	ch := make(chan net.Conn, 1)
+	p.writeMu.Lock()
+	p.waiting[id] = ch
+	err := writeRequest(p.ctrlW, id, addr)
+	p.writeMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
 	select {
-	case <-n.ready:
+	case conn := <-ch:
+		if conn == nil {
+			return nil, fmt.Errorf("relay: dial via %q failed", peerName)
+		}
+		return conn, nil
 	case <-ctx.Done():
+		p.writeMu.Lock()
+		delete(p.waiting, id)
+		p.writeMu.Unlock()
 		return nil, ctx.Err()
 	}
-	n.mu.Lock()
-	client := n.client
-	n.mu.Unlock()
-	if client == nil {
-		return nil, fmt.Errorf("relay: not connected")
-	}
-	return client.TCP(addr)
 }
 
-// DialVia dials addr through a specific exit node's network.
-// Traffic flows: this node → bridge → target node → internet.
-func (n *Node) DialVia(ctx context.Context, nodeName, addr string) (net.Conn, error) {
-	select {
-	case <-n.ready:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+// DialVia dials addr through a chain of peers.
+// path = ["au", "jp"] means: this node → au → jp → internet.
+func (n *Node) DialVia(ctx context.Context, path []string, addr string) (net.Conn, error) {
+	if len(path) == 0 {
+		return nil, fmt.Errorf("relay: empty path")
 	}
-	n.mu.Lock()
-	client := n.client
-	n.mu.Unlock()
-	if client == nil {
-		return nil, fmt.Errorf("relay: not connected")
+	if len(path) == 1 {
+		return n.DialTCP(ctx, path[0], addr)
 	}
-	// Encode as _relay_via_<nodeName>_<addr>:0
-	viaAddr := streamViaPrefix + nodeName + "_" + addr + ":0"
-	return client.TCP(viaAddr)
+
+	// Multi-hop: connect to first peer, ask it to route via remaining path
+	firstPeer := path[0]
+	n.mu.RLock()
+	p, ok := n.peers[firstPeer]
+	n.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("relay: peer %q not connected", firstPeer)
+	}
+
+	// Build nested via address
+	remaining := strings.Join(path[1:], "/")
+	viaAddr := streamViaPrefix + remaining + "_" + addr + ":0"
+
+	if p.client != nil {
+		return p.client.TCP(viaAddr)
+	}
+
+	return nil, fmt.Errorf("relay: cannot route via inbound peer %q for multi-hop", firstPeer)
 }
 
-// HasPeer returns true if connected to the bridge.
-func (n *Node) HasPeer() bool {
-	select {
-	case <-n.ready:
-		return true
-	default:
-		return false
-	}
-}
+// --- Wire helpers ---
 
-// --- wire helpers ---
+func parseVia(reqAddr string) (nodeName, targetAddr string, ok bool) {
+	if !strings.HasPrefix(reqAddr, streamViaPrefix) {
+		return "", "", false
+	}
+	rest := reqAddr[len(streamViaPrefix):]
+	idx := strings.Index(rest, "_")
+	if idx <= 0 {
+		return "", "", false
+	}
+	nodeName = rest[:idx]
+	targetAddr = strings.TrimSuffix(rest[idx+1:], ":0")
+	return nodeName, targetAddr, true
+}
 
 func writeString(w io.Writer, s string) error {
 	b := []byte(s)
