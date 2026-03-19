@@ -1,95 +1,111 @@
 # hysteria-relay
 
-Bidirectional traffic forwarding through a [Hysteria 2](https://github.com/apernet/hysteria) tunnel.
+Multi-node traffic forwarding through [Hysteria 2](https://github.com/apernet/hysteria) tunnels.
 
-Once two nodes establish an hy2 connection, **either side can route traffic through the other's network**. There is no fixed entry/exit role — both nodes are symmetric.
+A central **bridge** (hy2 server) coordinates multiple **nodes** (hy2 clients). Each node can advertise itself as an exit node. The bridge selects which node to route traffic through — like [Tailscale](https://tailscale.com)'s exit node model, but over hy2.
 
-## How It Works
+## Architecture
 
 ```
-Node A (e.g. behind NAT)            Node B (e.g. public IP)
-┌──────────────────────┐            ┌──────────────────────┐
-│  hy2 CLIENT          │──tunnel──► │  hy2 SERVER          │
-│  relay.Node          │            │  relay.Node           │
-│                      │            │                       │
-│  A.DialTCP(addr) ────┼──hy2 TCP──►│  Outbound dials addr  │
-│  Outbound dials addr◄┼──control───┤  B.DialTCP(addr)      │
-└──────────────────────┘            └───────────────────────┘
+                 ┌──────────────────┐
+                 │   Bridge          │
+                 │   (hy2 server)    │
+                 │                   │
+                 │  SOCKS5 :1080     │
+                 │  exit_node: "jp"  │──► routes user traffic to JP
+                 └─┬───────┬───────┬┘
+                   │       │       │
+          ┌────────┘       │       └────────┐
+     ┌────▼──────┐   ┌────▼──────┐   ┌─────▼─────┐
+     │ Node "au" │   │ Node "jp" │   │ Node "us" │
+     │ exit: yes │   │ exit: yes │   │ exit: yes │
+     │           │   │           │   │           │
+     │ 203.x.x.x│   │ 154.x.x.x│   │ ...       │
+     └───────────┘   └───────────┘   └───────────┘
 ```
 
-- **A → B direction** (client side calls `DialTCP`): direct passthrough to `client.TCP(addr)` — standard hy2 behavior, zero relay overhead. The hy2 server's `Outbound.TCP` dials the target.
-- **B → A direction** (server side calls `DialTCP`): uses a relay control stream inside the hy2 tunnel, because hy2 server cannot initiate streams to the client. The client dials the target and opens a data stream back.
-
-All traffic flows inside the hy2 tunnel — hy2 handles NAT traversal, encryption, authentication, and Brutal CC.
+- Nodes connect outward to the bridge (NAT traversal via hy2)
+- Each node registers a name and whether it's an exit
+- The bridge picks which node to forward traffic through
+- Nodes can also exit through the bridge's own network
+- All traffic flows inside hy2 tunnels (encrypted, authenticated, Brutal CC)
 
 ## Usage
 
-### Node A (hy2 client side)
+### Bridge (hy2 server side)
 
 ```go
-node := relay.NewNode()
-
-hyClient, _, _ := hyclient.NewClient(&hyclient.Config{
-    ServerAddr: serverAddr,
-    Auth:       "password",
-    TLSConfig:  ...,
-})
-
-// Attach opens control streams inside the hy2 tunnel. Blocks.
-go node.Attach(ctx, hyClient)
-
-// Traffic exits through Node B's network (direct client.TCP passthrough):
-conn, _ := node.DialTCP(ctx, "example.com:443")
-```
-
-### Node B (hy2 server side)
-
-```go
-node := relay.NewNode()
+bridge := relay.NewBridge()
 
 hyServer, _ := hyserver.NewServer(&hyserver.Config{
     Conn:          udpConn,
-    TLSConfig:     ...,
-    Authenticator: ...,
-    Outbound:      &myOutbound{node: node},
+    Outbound:      &myOutbound{bridge: bridge},
+    ...
 })
 go hyServer.Serve()
 
-// Traffic exits through Node A's network (via relay control stream):
-conn, _ := node.DialTCP(ctx, "10.0.0.1:22")
+// Route through a specific exit node:
+conn, _ := bridge.DialTCP(ctx, "jp", "example.com:443")
+
+// Or list available exits:
+for _, n := range bridge.ExitNodes() {
+    fmt.Println(n.Name)
+}
+```
+
+### Node (hy2 client side)
+
+```go
+node := relay.NewNode(relay.NodeConfig{
+    Name:     "jp",
+    ExitNode: true,
+})
+
+hyClient, _, _ := hyclient.NewClient(&hyclient.Config{...})
+go node.Attach(ctx, hyClient) // registers with bridge, handles dial requests
+
+// Exit through bridge's network (standard hy2 passthrough):
+conn, _ := node.DialTCP(ctx, "example.com:443")
 ```
 
 ### Outbound integration
 
-The hy2 server's `Outbound.TCP` must route relay streams to the node:
-
 ```go
-type myOutbound struct { node *relay.Node }
-
 func (o *myOutbound) TCP(reqAddr string) (net.Conn, error) {
     if relay.IsRelayStream(reqAddr) {
         c1, c2 := net.Pipe()
-        go o.node.HandleStream(ctx, reqAddr, c1)
+        go o.bridge.HandleStream(ctx, reqAddr, c1)
         return c2, nil
     }
-    return net.Dial("tcp", reqAddr)  // normal outbound
+    return net.Dial("tcp", reqAddr)
 }
 ```
 
 ## API
 
 ```go
-func NewNode() *Node
-func (n *Node) Attach(ctx context.Context, client hyclient.Client) error
-func (n *Node) HandleStream(ctx context.Context, reqAddr string, stream net.Conn)
-func (n *Node) DialTCP(ctx context.Context, addr string) (net.Conn, error)
+// Bridge
+func NewBridge() *Bridge
+func (b *Bridge) HandleStream(ctx, reqAddr, stream)
+func (b *Bridge) DialTCP(ctx, nodeName, addr) (net.Conn, error)
+func (b *Bridge) Nodes() []NodeInfo
+func (b *Bridge) ExitNodes() []NodeInfo
+func (b *Bridge) HasNode(name) bool
+
+// Node
+func NewNode(NodeConfig) *Node
+func (n *Node) Attach(ctx, client) error   // blocks, auto-reconnects on return
+func (n *Node) DialTCP(ctx, addr) (net.Conn, error)  // exits via bridge
 func (n *Node) HasPeer() bool
+
+// Helpers
 func IsRelayStream(addr string) bool
 ```
 
 ## Design
 
-- **Symmetric**: single `Node` type, no entry/exit distinction
+- **Hub-and-spoke**: bridge is the central relay, nodes connect outward
 - **Inside hy2**: all relay traffic flows through hy2 TCP streams
-- **Zero overhead on client side**: `DialTCP` is a direct `client.TCP` passthrough
-- **No custom transport**: no extra ports, no separate auth, no framing
+- **Node.DialTCP**: direct `client.TCP` passthrough, zero overhead
+- **Bridge.DialTCP**: sends request to node via control stream, node dials target
+- **Auto-reconnect**: `Attach` returns on disconnect, caller retries
