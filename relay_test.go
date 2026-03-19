@@ -233,9 +233,9 @@ func selfSignedCert(t *testing.T) tls.Certificate {
 // Verify IsRelayStream
 func TestIsRelayStream(t *testing.T) {
 	for _, tc := range []struct{ addr string; want bool }{
-		{"_relay_c2s_ctrl_", true},
-		{"_relay_s2c_ctrl_", true},
-		{"_relay_data_123", true},
+		{"_relay_c2s_ctrl_:0", true},
+		{"_relay_s2c_ctrl_:0", true},
+		{"_relay_data_123:0", true},
 		{"example.com:443", false},
 		{"10.0.0.1:22", false},
 	} {

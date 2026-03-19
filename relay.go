@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	streamCtrlC2S    = "_relay_c2s_ctrl_"
-	streamCtrlS2C    = "_relay_s2c_ctrl_"
-	streamDataPrefix = "_relay_data_"
+	streamCtrlC2S    = "_relay_c2s_ctrl_:0"
+	streamCtrlS2C    = "_relay_s2c_ctrl_:0"
+	streamDataPrefix = "_relay_data_"  // suffixed with id:0
+	streamDataSuffix = ":0"
 )
 
 func IsRelayStream(addr string) bool {
@@ -90,7 +91,7 @@ func (n *Node) dialAndStream(ctx context.Context, client hyclient.Client, id, ad
 	}
 	defer target.Close()
 
-	stream, err := client.TCP(streamDataPrefix + id)
+	stream, err := client.TCP(streamDataPrefix + id + streamDataSuffix)
 	if err != nil {
 		return
 	}
@@ -121,7 +122,7 @@ func (n *Node) HandleStream(ctx context.Context, reqAddr string, stream net.Conn
 
 	default:
 		if strings.HasPrefix(reqAddr, streamDataPrefix) {
-			id := reqAddr[len(streamDataPrefix):]
+			id := strings.TrimSuffix(reqAddr[len(streamDataPrefix):], streamDataSuffix)
 			// Try to deliver to a waiter, with retries for race conditions
 			for i := 0; i < 50; i++ {
 				n.mu.Lock()
@@ -207,7 +208,7 @@ func (n *Node) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
 	if client != nil {
 		// We're hy2 client side. Peer (server) dials target and waits in
 		// waiting map. We open data stream to deliver it.
-		stream, err := client.TCP(streamDataPrefix + id)
+		stream, err := client.TCP(streamDataPrefix + id + streamDataSuffix)
 		if err != nil {
 			return nil, err
 		}
