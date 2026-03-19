@@ -179,6 +179,12 @@ func (n *Node) serveDials(ctx context.Context, ctrl net.Conn) {
 }
 
 // DialTCP dials addr through the peer's network.
+//
+// On the hy2 client side, this is a direct passthrough to client.TCP(addr) —
+// standard hy2 behavior, maximum efficiency, zero relay overhead.
+//
+// On the hy2 server side, this uses the relay control stream protocol
+// because hy2 server cannot initiate streams to the client.
 func (n *Node) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
 	select {
 	case <-n.ready:
@@ -186,33 +192,30 @@ func (n *Node) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
 		return nil, ctx.Err()
 	}
 
-	id := fmt.Sprintf("%d", n.seq.Add(1))
-
 	n.mu.Lock()
+	client := n.client
 	ctrl := n.ctrlW
-	client := n.client // non-nil if we're hy2 client side
 	n.mu.Unlock()
 
+	// Fast path: hy2 client side — just use client.TCP directly.
+	// hy2 server's Outbound.TCP will dial the target. No relay overhead.
+	if client != nil {
+		return client.TCP(addr)
+	}
+
+	// Slow path: hy2 server side — need relay protocol.
 	if ctrl == nil {
 		return nil, fmt.Errorf("relay: no peer")
 	}
 
-	// Send dial request to peer
+	id := fmt.Sprintf("%d", n.seq.Add(1))
+
+	// Send dial request to peer via control stream
 	n.writeMu.Lock()
 	err := writeRequest(ctrl, id, addr)
 	n.writeMu.Unlock()
 	if err != nil {
 		return nil, err
-	}
-
-	if client != nil {
-		// We're hy2 client side. Peer (server) dials target and waits in
-		// waiting map. We open data stream to deliver it.
-		stream, err := client.TCP(streamDataPrefix + id + streamDataSuffix)
-		if err != nil {
-			return nil, err
-		}
-		return stream, nil
 	}
 
 	// We're hy2 server side. Peer (client) will dial target and open
